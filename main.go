@@ -27,21 +27,22 @@ import (
 
 // 基准测试配置
 var (
-	VUS                   = 10                             // 并发用户数
-	ZONE_START            = 100                            // 起始区ID
-	ZONES_TOTAL           = 10                             // 总区数
-	RECORDS_PER_ZONE      = 80                             // 每区玩家数
-	EDGES_PER_RELATION    = 100                            // 每种关系的边数
-	TOTAL_VERTICES        = ZONES_TOTAL * RECORDS_PER_ZONE // 总顶点数（使用固定的 IDS_PER_ZONE = 8000）
-	STR_ATTR_CNT          = 10                             // 字符串属性数量
-	INT_ATTR_CNT          = 90                             // 整数属性数量
-	PreGenerateVertexData = true                           // 是否预生成所有顶点数据
-	BATCH_NUM             = 1                              // 批量写入大小
-	instanceID            = "graph-demo"
-	GRAPH_NAME            = "graph0618"
-	credentialsFile       = "your-gcp-credential.json" // GCP credentials file path
-	projectID             = "your-gcp-project-id"
-	databaseID            = "mtbench"
+	VUS                    = 10                             // 并发用户数
+	ZONE_START             = 100                            // 起始区ID
+	ZONES_TOTAL            = 10                             // 总区数
+	RECORDS_PER_ZONE       = 80                             // 每区玩家数
+	EDGES_PER_RELATION     = 100                            // 每种关系的边数
+	TOTAL_VERTICES         = ZONES_TOTAL * RECORDS_PER_ZONE // 总顶点数（使用固定的 IDS_PER_ZONE = 8000）
+	STR_ATTR_CNT           = 10                             // 字符串属性数量
+	INT_ATTR_CNT           = 90                             // 整数属性数量
+	PreGenerateVertexData  = true                           // 是否预生成所有顶点数据
+	ShuffleProcessingOrder = false                          // 是否随机化处理顺序以避免热点
+	BATCH_NUM              = 1                              // 批量写入大小
+	instanceID             = "graph-demo"
+	GRAPH_NAME             = "g0618"
+	credentialsFile        = "your-gcp-credential.json" // GCP credentials file path
+	projectID              = "your-gcp-project-id"
+	databaseID             = "mtbench"
 )
 
 // VertexData represents a vertex to be inserted
@@ -449,6 +450,75 @@ func countdownOrExit(action string, seconds int) {
 	}
 }
 
+// generateShuffledIndices creates a shuffled list of indices to randomize processing order
+func generateShuffledIndices(totalVertices int) []int {
+	indices := make([]int, totalVertices)
+	for i := 0; i < totalVertices; i++ {
+		indices[i] = i
+	}
+
+	if ShuffleProcessingOrder {
+		rand.Shuffle(len(indices), func(i, j int) {
+			indices[i], indices[j] = indices[j], indices[i]
+		})
+		log.Printf("Shuffled processing order for %d vertices to avoid hotspots", totalVertices)
+	} else {
+		log.Printf("Using sequential processing order for %d vertices", totalVertices)
+	}
+
+	return indices
+}
+
+// generateVertexForIndex generates vertex data for a specific index
+func generateVertexForIndex(index int) *VertexData {
+	// Convert index to UID (existing logic)
+	zoneOffset := index / RECORDS_PER_ZONE
+	idInZone := index%RECORDS_PER_ZONE + 1
+	zoneID := ZONE_START + zoneOffset
+	uid := (int64(zoneID) << 40) | int64(idInZone)
+
+	// Use UID as seed for consistent data generation
+	rng := rand.New(rand.NewSource(uid))
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+	// Generate string attributes
+	strAttrs := make([]string, STR_ATTR_CNT)
+	for i := 0; i < STR_ATTR_CNT; i++ {
+		strAttrs[i] = randFixedString(rng, letters, 20)
+	}
+
+	// Generate integer attributes
+	intAttrs := make([]int64, INT_ATTR_CNT)
+	for i := 0; i < INT_ATTR_CNT; i++ {
+		intAttrs[i] = rng.Int63n(10000)
+	}
+
+	return &VertexData{
+		UID:      uid,
+		StrAttrs: strAttrs,
+		IntAttrs: intAttrs,
+	}
+}
+
+// generateShuffledPlayerIndices creates a shuffled list of player indices to randomize edge processing order
+func generateShuffledPlayerIndices(totalPlayers int) []int {
+	indices := make([]int, totalPlayers)
+	for i := 0; i < totalPlayers; i++ {
+		indices[i] = i
+	}
+
+	if ShuffleProcessingOrder {
+		rand.Shuffle(len(indices), func(i, j int) {
+			indices[i], indices[j] = indices[j], indices[i]
+		})
+		log.Printf("Shuffled processing order for %d players to avoid edge hotspots", totalPlayers)
+	} else {
+		log.Printf("Using sequential processing order for %d players", totalPlayers)
+	}
+
+	return indices
+}
+
 // spannerWriteVertexTest performs vertex write testing with multiple goroutines
 func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 	log.Println("Starting Spanner vertex write test...")
@@ -461,6 +531,9 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 
 	totalVertices := ZONES_TOTAL * RECORDS_PER_ZONE
 	verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
+
+	// Generate shuffled indices for randomized processing order
+	processingIndices := generateShuffledIndices(totalVertices)
 
 	var vertices []*VertexData
 
@@ -504,41 +577,18 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 			workerSuccessCount := 0
 			workerErrorCount := 0
 
-			// Initialize random generator for this worker (used when preGenerate=false)
-			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
-			letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-
 			// Process vertices assigned to this worker
 			for i := startIdx; i < endIdx; i++ {
+				// Get the actual index to process (potentially shuffled)
+				actualIndex := processingIndices[i]
 				var vertex *VertexData
 
 				if preGenerate {
 					// Use pre-generated data
-					vertex = vertices[i]
+					vertex = vertices[actualIndex]
 				} else {
-					// Generate vertex on-the-fly
-					zoneOffset := i / RECORDS_PER_ZONE
-					idInZone := i%RECORDS_PER_ZONE + 1
-					zoneID := ZONE_START + zoneOffset
-					uid := (int64(zoneID) << 40) | int64(idInZone)
-
-					// Generate string attributes
-					strAttrs := make([]string, STR_ATTR_CNT)
-					for j := 0; j < STR_ATTR_CNT; j++ {
-						strAttrs[j] = randFixedString(rng, letters, 20)
-					}
-
-					// Generate integer attributes
-					intAttrs := make([]int64, INT_ATTR_CNT)
-					for j := 0; j < INT_ATTR_CNT; j++ {
-						intAttrs[j] = rng.Int63n(10000)
-					}
-
-					vertex = &VertexData{
-						UID:      uid,
-						StrAttrs: strAttrs,
-						IntAttrs: intAttrs,
-					}
+					// Generate vertex on-the-fly using the shuffled index
+					vertex = generateVertexForIndex(actualIndex)
 				}
 
 				// Build mutation for this vertex
@@ -630,6 +680,9 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 	log.Printf("Total zones: %d, players per zone: %d", totalZones, RECORDS_PER_ZONE)
 	log.Printf("Total players: %d, Total edges to insert: %d", totalPlayers, totalEdges)
 
+	// Generate shuffled player indices for randomized processing order
+	playerProcessingIndices := generateShuffledPlayerIndices(int(totalPlayers))
+
 	// Assign players to workers
 	playersPerWorker := int(math.Ceil(float64(totalPlayers) / float64(VUS)))
 
@@ -662,30 +715,51 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 
 			// Process players assigned to this worker
-			for playerIndex := workerStartIndex; playerIndex < workerEndIndex; playerIndex++ {
-				// Convert playerIndex to corresponding UID
-				zoneOffset := playerIndex / RECORDS_PER_ZONE
-				idInZone := playerIndex%RECORDS_PER_ZONE + 1
+			for i := workerStartIndex; i < workerEndIndex; i++ {
+				// Get the actual player index to process (potentially shuffled)
+				actualPlayerIndex := playerProcessingIndices[i]
+
+				// Convert actualPlayerIndex to corresponding UID
+				zoneOffset := actualPlayerIndex / RECORDS_PER_ZONE
+				idInZone := actualPlayerIndex%RECORDS_PER_ZONE + 1
 				currentZoneID := startZoneID + zoneOffset
 				playerUID := (int64(currentZoneID) << 40) | int64(idInZone)
 
 				// Create 5 types of relationships for this player
 				relationTypes := []string{"Rel1", "Rel2", "Rel3", "Rel4", "Rel5"}
 
+				// Move batch logic outside relationship loop to respect BATCH_NUM
+				var mutations []*spanner.Mutation
+
 				for _, relType := range relationTypes {
-					// Create mutations for EDGES_PER_RELATION edges of this relationship type
-					var mutations []*spanner.Mutation
+					// Track used targets for this relationship type to prevent duplicates
+					usedTargets := make(map[int64]bool)
 
-					for i := 0; i < EDGES_PER_RELATION; i++ {
-						// Randomly select target UID
-						targetZoneID := ZONE_START + rng.Intn(ZONES_TOTAL)
-						targetID := 1 + rng.Intn(RECORDS_PER_ZONE)
-						targetUID := (int64(targetZoneID) << 40) | int64(targetID)
+					edgesCreated := 0
+					for edgesCreated < EDGES_PER_RELATION {
+						var targetUID int64
+						maxRetries := 100 // Prevent infinite loops
+						found := false
 
-						if targetUID == playerUID {
-							// Skip self-loop
-							log.Printf("ERROR: Worker %d skipped self-loop for player %d (%s),targetZoneid=%d,targetID=%d", workerID, playerUID, relType, targetZoneID, targetID)
-							continue
+						// Try to find a unique target UID
+						for retry := 0; retry < maxRetries; retry++ {
+							targetZoneID := ZONE_START + rng.Intn(ZONES_TOTAL)
+							targetID := 1 + rng.Intn(RECORDS_PER_ZONE)
+							targetUID = (int64(targetZoneID) << 40) | int64(targetID)
+
+							// Check for self-loops and duplicates
+							if targetUID != playerUID && !usedTargets[targetUID] {
+								usedTargets[targetUID] = true
+								found = true
+								break
+							}
+						}
+
+						if !found {
+							// If we can't find a unique target after maxRetries, log warning and continue
+							log.Printf("Worker %d: Could not find unique target for player %d (%s) after %d retries, created %d/%d edges",
+								workerID, playerUID, relType, maxRetries, edgesCreated, EDGES_PER_RELATION)
+							break
 						}
 
 						// Generate edge attributes attr101-attr110
@@ -697,9 +771,10 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 						// Build mutation for this edge
 						mutation := buildEdgeMutation(relType, playerUID, targetUID, edgeAttrs)
 						mutations = append(mutations, mutation)
+						edgesCreated++
 
-						// Execute batch when reaching batchNum or at the end
-						if len(mutations) >= batchNum || i == EDGES_PER_RELATION-1 {
+						// Execute batch when reaching BATCH_NUM (respects configured batch size)
+						if len(mutations) >= batchNum {
 							insertStart := time.Now()
 							_, err := client.Apply(context.Background(), mutations)
 							insertDuration := time.Since(insertStart)
@@ -708,8 +783,8 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 							metricsCollector.AddDuration(workerID, insertDuration)
 
 							if err != nil {
-								log.Printf("Worker %d edge batch insert failed for player %d (%s), batch size %d: %s",
-									workerID, playerUID, relType, len(mutations), err.Error())
+								log.Printf("Worker %d edge batch insert failed for player %d, batch size %d: %s",
+									workerID, playerUID, len(mutations), err.Error())
 								workerErrorCount += len(mutations)
 								metricsCollector.AddError(int64(len(mutations)))
 							} else {
@@ -723,10 +798,30 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 					}
 				}
 
+				// Execute any remaining mutations after all relationships for this player
+				if len(mutations) > 0 {
+					insertStart := time.Now()
+					_, err := client.Apply(context.Background(), mutations)
+					insertDuration := time.Since(insertStart)
+
+					// Record metrics for the final batch
+					metricsCollector.AddDuration(workerID, insertDuration)
+
+					if err != nil {
+						log.Printf("Worker %d final edge batch insert failed for player %d, batch size %d: %s",
+							workerID, playerUID, len(mutations), err.Error())
+						workerErrorCount += len(mutations)
+						metricsCollector.AddError(int64(len(mutations)))
+					} else {
+						workerSuccessCount += len(mutations)
+						metricsCollector.AddSuccess(int64(len(mutations)))
+					}
+				}
+
 				// Log progress every 10 players
-				if (playerIndex-workerStartIndex+1)%100 == 0 {
+				if (i-workerStartIndex+1)%100 == 0 {
 					log.Printf("Worker %d processed player %d (UID: %d), success: %d, errors: %d",
-						workerID, playerIndex, playerUID, workerSuccessCount, workerErrorCount)
+						workerID, i, playerUID, workerSuccessCount, workerErrorCount)
 				}
 			}
 
@@ -788,7 +883,14 @@ func spannerReadRelationTest(ctx context.Context, dbPath string) {
 	// Metrics
 	metricsCollector := metrics.NewConcurrentMetrics(VUS)
 
-	log.Printf("Starting %d read workers…,dbpath=%s", VUS, dbPath)
+	// Create single shared client for all read workers (thread-safe for reads)
+	client, err := spanner.NewClient(ctx, dbPath, option.WithCredentialsFile(credentialsFile))
+	if err != nil {
+		log.Fatalf("Failed to create Spanner client: %v", err)
+	}
+	defer client.Close()
+
+	log.Printf("Starting %d read workers with shared client, dbpath=%s", VUS, dbPath)
 	countdownOrExit("开始读取关系", 5)
 
 	for vu := 0; vu < VUS; vu++ {
@@ -796,12 +898,6 @@ func spannerReadRelationTest(ctx context.Context, dbPath string) {
 		go func(vuIndex int) {
 			defer wg.Done()
 			log.Printf("VU %d started, will process %d vertices", vuIndex, iterPerVU)
-			client, err := spanner.NewClient(ctx, dbPath, option.WithCredentialsFile(credentialsFile))
-			if err != nil {
-				log.Printf("Failed to create Spanner client: %v", err)
-				return
-			}
-			defer client.Close()
 
 			ctx := context.Background()
 
@@ -919,6 +1015,9 @@ func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 	totalVertices := ZONES_TOTAL * RECORDS_PER_ZONE
 	verticesPerWorker := int(math.Ceil(float64(totalVertices) / float64(VUS)))
 
+	// Generate shuffled indices for randomized processing order
+	processingIndices := generateShuffledIndices(totalVertices)
+
 	log.Printf("Workers will generate vertices on-the-fly. Total: %d vertices, %d workers, batch size: %d...", totalVertices, VUS, batchNum)
 
 	log.Printf("Starting %d write workers...", VUS)
@@ -941,38 +1040,16 @@ func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 			workerSuccessCount := 0
 			workerErrorCount := 0
 
-			// Initialize random generator for this worker
-			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
-			letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-
 			// Batch mutations
 			var mutations []*spanner.Mutation
 
 			// Process vertices assigned to this worker
 			for i := startIdx; i < endIdx; i++ {
-				// Generate vertex on-the-fly
-				zoneOffset := i / RECORDS_PER_ZONE
-				idInZone := i%RECORDS_PER_ZONE + 1
-				zoneID := ZONE_START + zoneOffset
-				uid := (int64(zoneID) << 40) | int64(idInZone)
+				// Get the actual index to process (potentially shuffled)
+				actualIndex := processingIndices[i]
 
-				// Generate string attributes
-				strAttrs := make([]string, STR_ATTR_CNT)
-				for j := 0; j < STR_ATTR_CNT; j++ {
-					strAttrs[j] = randFixedString(rng, letters, 20)
-				}
-
-				// Generate integer attributes
-				intAttrs := make([]int64, INT_ATTR_CNT)
-				for j := 0; j < INT_ATTR_CNT; j++ {
-					intAttrs[j] = rng.Int63n(10000)
-				}
-
-				vertex := &VertexData{
-					UID:      uid,
-					StrAttrs: strAttrs,
-					IntAttrs: intAttrs,
-				}
+				// Generate vertex on-the-fly using the shuffled index
+				vertex := generateVertexForIndex(actualIndex)
 
 				// Build mutation for this vertex
 				mutation := buildVertexMutation(vertex)
@@ -1087,6 +1164,16 @@ func initFromEnv() {
 		}
 	}
 
+	// Initialize ShuffleProcessingOrder from environment variable
+	if shuffleStr := os.Getenv("SHUFFLE_PROCESSING_ORDER"); shuffleStr != "" {
+		lower := strings.ToLower(shuffleStr)
+		if lower == "false" || lower == "0" {
+			ShuffleProcessingOrder = false
+		} else if lower == "true" || lower == "1" {
+			ShuffleProcessingOrder = true
+		}
+	}
+
 	// Recalculate TOTAL_VERTICES after configuration changes
 	TOTAL_VERTICES = ZONES_TOTAL * RECORDS_PER_ZONE
 
@@ -1117,8 +1204,8 @@ func initFromEnv() {
 		databaseID = dbID
 	}
 
-	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, BATCH_NUM=%d, credentialsFile=%s",
-		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, BATCH_NUM, credentialsFile)
+	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, BATCH_NUM=%d, credentialsFile=%s",
+		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, BATCH_NUM, credentialsFile)
 }
 
 // setupLogging configures logging to output to both terminal and file
