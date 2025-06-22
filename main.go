@@ -19,11 +19,30 @@ import (
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	"github.com/dgryski/go-farm"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	"google.golang.org/grpc/status"
 )
+
+const (
+	ShardBucketCount = 1024 // 改这里即可增减 shard 桶数
+)
+
+func calcShard(uid int64) int64 {
+	// FarmHash 64 位，参数需 []byte
+	h := farm.Fingerprint64([]byte(strconv.FormatInt(uid, 10)))
+	return int64(h % uint64(ShardBucketCount))
+}
+
+func buildUserProps() string {
+	props := []string{"shard", "uid"}
+	for i := 1; i <= 100; i++ {
+		props = append(props, fmt.Sprintf("attr%d", i))
+	}
+	return strings.Join(props, ", ")
+}
 
 // 基准测试配置
 var (
@@ -82,15 +101,16 @@ func setupTableWithoutIndex(ctx context.Context) error {
 	for _, label := range edgeLabels {
 		ddl = append(ddl, fmt.Sprintf("DROP TABLE IF EXISTS %s", label))
 	}
-	ddl = append(ddl, "DROP INDEX IF EXISTS user_attr11_attr12_attr13_idx")
+	ddl = append(ddl, "DROP INDEX IF EXISTS user_shard_attr11_attr12_attr13_idx")
 	for _, label := range edgeLabels {
-		ddl = append(ddl, fmt.Sprintf("DROP INDEX IF EXISTS %s_uid_attr_covering_idx", strings.ToLower(label)))
+		ddl = append(ddl, fmt.Sprintf("DROP INDEX IF EXISTS %s_shard_uid_attr_covering_idx", strings.ToLower(label)))
 	}
 	ddl = append(ddl, "DROP TABLE IF EXISTS Users")
 
 	// 2. Vertex table
 	ddl = append(ddl, `
 CREATE TABLE Users (
+  shard        INT64  NOT NULL,
   uid          INT64  NOT NULL,
   attr1        STRING(20),
   attr2        STRING(20),
@@ -193,7 +213,7 @@ CREATE TABLE Users (
   attr99       INT64,
   attr100      INT64,
   expire_time  TIMESTAMP OPTIONS (allow_commit_timestamp=true)
-) PRIMARY KEY (uid)`)
+) PRIMARY KEY (shard, uid)`)
 
 	// Add TTL policy for Users table
 	ddl = append(ddl,
@@ -206,6 +226,7 @@ CREATE TABLE Users (
 		// FIXED: Renamed src_uid to uid to match parent table's PK for interleaving
 		ddl = append(ddl, fmt.Sprintf(`
 CREATE TABLE %s (
+  shard        INT64      NOT NULL,
   uid          INT64      NOT NULL,
   dst_uid      INT64      NOT NULL,
   attr101      INT64,
@@ -219,7 +240,7 @@ CREATE TABLE %s (
   attr109      INT64,
   attr110      INT64,
   expire_time  TIMESTAMP OPTIONS (allow_commit_timestamp=true)
-) PRIMARY KEY (uid, dst_uid),
+) PRIMARY KEY (shard, uid, dst_uid),
   INTERLEAVE IN PARENT Users ON DELETE CASCADE`, label))
 
 		ddl = append(ddl, fmt.Sprintf(
@@ -234,7 +255,7 @@ CREATE TABLE %s (
 		// FIXED: SOURCE KEY now correctly references 'uid'
 		edgeDefs = append(edgeDefs, fmt.Sprintf(`
   %s
-    SOURCE KEY (uid) REFERENCES Users(uid)
+    SOURCE KEY (shard, uid) REFERENCES Users(shard, uid)
     DESTINATION KEY (dst_uid) REFERENCES Users(uid)
     LABEL %s PROPERTIES (attr101, attr102, attr103, attr104, attr105, attr106, attr107, attr108, attr109, attr110)`, l, l))
 	}
@@ -246,11 +267,11 @@ CREATE TABLE %s (
 
 	graphDDL := fmt.Sprintf(`CREATE PROPERTY GRAPH %s
 NODE TABLES (
-  Users KEY (uid)
+  Users KEY (shard, uid)
     LABEL User PROPERTIES (%s)
 )
 EDGE TABLES (%s
-)`, GRAPH_NAME, strings.Join(userProps, ", "), strings.Join(edgeDefs, ","))
+)`, GRAPH_NAME, buildUserProps(), strings.Join(edgeDefs, ","))
 
 	ddl = append(ddl, graphDDL)
 
@@ -321,15 +342,15 @@ func setupAllTableIndexes(ctx context.Context) error {
 
 	// Create index for Users table
 	ddl = append(ddl,
-		`CREATE INDEX user_attr11_attr12_attr13_idx
-		   ON Users(attr11, attr12, attr13)`,
+		`CREATE INDEX user_shard_attr11_attr12_attr13_idx
+		   ON Users(shard, attr11, attr12, attr13)`,
 	)
 
 	// Create indexes for edge tables
 	for _, label := range edgeLabels {
 		ddl = append(ddl, fmt.Sprintf(
-			`CREATE INDEX %s_uid_attr_covering_idx
-			   ON %s(uid, attr101, attr102, attr103)`,
+			`CREATE INDEX %s_shard_uid_attr_covering_idx
+			   ON %s(shard, uid, attr101, attr102, attr103)`,
 			strings.ToLower(label), label))
 	}
 
@@ -645,8 +666,8 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 // buildVertexMutation builds a Spanner mutation for inserting a vertex
 func buildVertexMutation(vertex *VertexData) *spanner.Mutation {
 	// Prepare columns and values for the Users table
-	columns := []string{"uid"}
-	values := []interface{}{vertex.UID}
+	columns := []string{"shard", "uid"}
+	values := []interface{}{calcShard(vertex.UID), vertex.UID}
 
 	// Add string attributes (attr1-attr10)
 	for i, strAttr := range vertex.StrAttrs {
@@ -852,8 +873,8 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 // buildEdgeMutation builds a Spanner mutation for inserting an edge
 func buildEdgeMutation(relType string, sourceUID, targetUID int64, attrs []int64) *spanner.Mutation {
 	// Prepare columns and values for the edge table
-	columns := []string{"uid", "dst_uid"}
-	values := []interface{}{sourceUID, targetUID}
+	columns := []string{"shard", "uid", "dst_uid"}
+	values := []interface{}{calcShard(sourceUID), sourceUID, targetUID}
 
 	// Add edge attributes attr101-attr110
 	for i, attr := range attrs {
