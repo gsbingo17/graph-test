@@ -37,12 +37,13 @@ var (
 	INT_ATTR_CNT           = 90                             // 整数属性数量
 	PreGenerateVertexData  = true                           // 是否预生成所有顶点数据
 	ShuffleProcessingOrder = false                          // 是否随机化处理顺序以避免热点
+	MaxCommitDelayMs       = 100                            // 最大提交延迟(毫秒)，用于提高写入吞吐量
 	BATCH_NUM              = 1                              // 批量写入大小
-	instanceID             = "graph-demo"
+	instanceID             = "test-instance"
 	GRAPH_NAME             = "g0618"
-	credentialsFile        = "your-gcp-credential.json" // GCP credentials file path
-	projectID              = "your-gcp-project-id"
-	databaseID             = "mtbench"
+	credentialsFile        = "binguo-learning-centre-352514-764d8f1e39e4.json" // GCP credentials file path
+	projectID              = "binguo-learning-centre-352514"
+	databaseID             = "graphdb"
 )
 
 // VertexData represents a vertex to be inserted
@@ -692,6 +693,19 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 	// Initialize metrics
 	metricsCollector := metrics.NewConcurrentMetrics(VUS)
 
+	// Configure max commit delay for throughput optimization
+	var applyOpts []spanner.ApplyOption
+	if MaxCommitDelayMs > 0 {
+		maxDelay := time.Duration(MaxCommitDelayMs) * time.Millisecond
+		commitOpts := spanner.CommitOptions{MaxCommitDelay: &maxDelay}
+		applyOpts = []spanner.ApplyOption{
+			spanner.ApplyCommitOptions(commitOpts),
+		}
+		log.Printf("Using max commit delay: %dms for edge write throughput optimization", MaxCommitDelayMs)
+	} else {
+		log.Println("Max commit delay disabled for edge writes (0ms)")
+	}
+
 	log.Printf("Starting %d edge write workers...", VUS)
 	countdownOrExit("开始写入边", 5)
 
@@ -776,7 +790,7 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 						// Execute batch when reaching BATCH_NUM (respects configured batch size)
 						if len(mutations) >= batchNum {
 							insertStart := time.Now()
-							_, err := client.Apply(context.Background(), mutations)
+							_, err := client.Apply(context.Background(), mutations, applyOpts...)
 							insertDuration := time.Since(insertStart)
 
 							// Record metrics for the batch
@@ -801,7 +815,7 @@ func spannerWriteEdgeTest(client *spanner.Client, startZoneID, endZoneID int, ba
 				// Execute any remaining mutations after all relationships for this player
 				if len(mutations) > 0 {
 					insertStart := time.Now()
-					_, err := client.Apply(context.Background(), mutations)
+					_, err := client.Apply(context.Background(), mutations, applyOpts...)
 					insertDuration := time.Since(insertStart)
 
 					// Record metrics for the final batch
@@ -1018,6 +1032,19 @@ func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 	// Generate shuffled indices for randomized processing order
 	processingIndices := generateShuffledIndices(totalVertices)
 
+	// Configure max commit delay for throughput optimization
+	var applyOpts []spanner.ApplyOption
+	if MaxCommitDelayMs > 0 {
+		maxDelay := time.Duration(MaxCommitDelayMs) * time.Millisecond
+		commitOpts := spanner.CommitOptions{MaxCommitDelay: &maxDelay}
+		applyOpts = []spanner.ApplyOption{
+			spanner.ApplyCommitOptions(commitOpts),
+		}
+		log.Printf("Using max commit delay: %dms for throughput optimization", MaxCommitDelayMs)
+	} else {
+		log.Println("Max commit delay disabled (0ms)")
+	}
+
 	log.Printf("Workers will generate vertices on-the-fly. Total: %d vertices, %d workers, batch size: %d...", totalVertices, VUS, batchNum)
 
 	log.Printf("Starting %d write workers...", VUS)
@@ -1058,7 +1085,7 @@ func spannerWriteBatchVertexTest(client *spanner.Client, batchNum int) {
 				// Execute batch when reaching batchNum or at the end
 				if len(mutations) >= batchNum || i == endIdx-1 {
 					insertStart := time.Now()
-					_, err := client.Apply(context.Background(), mutations)
+					_, err := client.Apply(context.Background(), mutations, applyOpts...)
 					insertDuration := time.Since(insertStart)
 
 					// Record metrics for the batch
@@ -1174,6 +1201,13 @@ func initFromEnv() {
 		}
 	}
 
+	// Initialize MaxCommitDelayMs from environment variable
+	if delayStr := os.Getenv("MAX_COMMIT_DELAY_MS"); delayStr != "" {
+		if parsedDelay, err := strconv.Atoi(delayStr); err == nil && parsedDelay >= 0 {
+			MaxCommitDelayMs = parsedDelay
+		}
+	}
+
 	// Recalculate TOTAL_VERTICES after configuration changes
 	TOTAL_VERTICES = ZONES_TOTAL * RECORDS_PER_ZONE
 
@@ -1204,8 +1238,8 @@ func initFromEnv() {
 		databaseID = dbID
 	}
 
-	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, BATCH_NUM=%d, credentialsFile=%s",
-		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, BATCH_NUM, credentialsFile)
+	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, MaxCommitDelayMs=%d, BATCH_NUM=%d, credentialsFile=%s",
+		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, MaxCommitDelayMs, BATCH_NUM, credentialsFile)
 }
 
 // setupLogging configures logging to output to both terminal and file
