@@ -40,11 +40,14 @@ var (
 	ShuffleProcessingOrder = false                          // 是否随机化处理顺序以避免热点
 	MaxCommitDelayMs       = 100                            // 最大提交延迟(毫秒)，用于提高写入吞吐量
 	BATCH_NUM              = 1                              // 批量写入大小
+	UseStaleReads          = false                          // 是否使用过期读取
+	StaleReadMode          = "max"                          // 过期读取模式: max, exact
+	StalenessMs            = 15000                          // 过期读取时间(毫秒)
 	instanceID             = "test-instance"
 	GRAPH_NAME             = "g0618"
 	credentialsFile        = "binguo-learning-centre-352514-764d8f1e39e4.json" // GCP credentials file path
 	projectID              = "binguo-learning-centre-352514"
-	databaseID             = "graphdb"
+	databaseID             = "graphdb1"
 )
 
 // VertexData represents a vertex to be inserted
@@ -324,7 +327,7 @@ func setupAllTableIndexes(ctx context.Context) error {
 	// Create index for Users table
 	ddl = append(ddl,
 		`CREATE INDEX user_attr11_attr12_attr13_idx
-		   ON Users(attr11, attr12, attr13)`,
+		   ON Users(uid, attr11, attr12, attr13) INTERLEAVE IN Users`,
 	)
 
 	// Create indexes for edge tables
@@ -598,7 +601,9 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 
 				// Execute insert
 				insertStart := time.Now()
-				_, err := client.Apply(context.Background(), []*spanner.Mutation{mutation})
+				// Log the UID being inserted for debugging
+				//log.Printf("Inserting vertex UID: %d", vertex.UID)
+				_, err := client.Apply(context.Background(), []*spanner.Mutation{mutation}, spanner.ApplyAtLeastOnce())
 				insertDuration := time.Since(insertStart)
 
 				// Record metrics
@@ -613,8 +618,8 @@ func spannerWriteVertexTest(client *spanner.Client, preGenerate bool) {
 					metricsCollector.AddSuccess(1)
 				}
 
-				// Log progress every 100 inserts
-				if (i-startIdx+1)%100 == 0 {
+				// Log progress every 1000 inserts
+				if (i-startIdx+1)%1000 == 0 {
 					log.Printf("Worker %d processed %d vertices, success: %d, errors: %d",
 						workerID, i-startIdx+1, workerSuccessCount, workerErrorCount)
 				}
@@ -968,7 +973,24 @@ func spannerReadRelationTest(ctx context.Context, dbPath string) {
 
 				queryStart := time.Now()
 				// Create a new single-use read-only transaction for each query
-				ro := client.Single()
+				var ro *spanner.ReadOnlyTransaction
+
+				if UseStaleReads {
+					// Configure stale read based on settings
+					if StaleReadMode == "max" {
+						// Maximum staleness - read data that's at most N milliseconds old
+						ro = client.Single().WithTimestampBound(
+							spanner.MaxStaleness(time.Duration(StalenessMs) * time.Millisecond))
+					} else if StaleReadMode == "exact" {
+						// Exact staleness - read data that's exactly N milliseconds old
+						ro = client.Single().WithTimestampBound(
+							spanner.ExactStaleness(time.Duration(StalenessMs) * time.Millisecond))
+					}
+				} else {
+					// Use strong consistency (default)
+					ro = client.Single()
+				}
+
 				iterRows := ro.Query(ctx, stmt)
 
 				// Consume rows and capture errors
@@ -1249,8 +1271,31 @@ func initFromEnv() {
 		databaseID = dbID
 	}
 
-	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, MaxCommitDelayMs=%d, BATCH_NUM=%d, credentialsFile=%s",
-		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, MaxCommitDelayMs, BATCH_NUM, credentialsFile)
+	// Initialize stale read settings
+	if staleReadsStr := os.Getenv("USE_STALE_READS"); staleReadsStr != "" {
+		lower := strings.ToLower(staleReadsStr)
+		if lower == "true" || lower == "1" {
+			UseStaleReads = true
+		} else if lower == "false" || lower == "0" {
+			UseStaleReads = false
+		}
+	}
+
+	if staleReadModeStr := os.Getenv("STALE_READ_MODE"); staleReadModeStr != "" {
+		lower := strings.ToLower(staleReadModeStr)
+		if lower == "max" || lower == "exact" {
+			StaleReadMode = lower
+		}
+	}
+
+	if stalenessStr := os.Getenv("STALENESS_MS"); stalenessStr != "" {
+		if parsedStaleness, err := strconv.Atoi(stalenessStr); err == nil && parsedStaleness >= 0 {
+			StalenessMs = parsedStaleness
+		}
+	}
+
+	log.Printf("Configuration: VUS=%d, ZONE_START=%d, ZONES_TOTAL=%d, RECORDS_PER_ZONE=%d, EDGES_PER_RELATION=%d, TOTAL_VERTICES=%d, PreGenerateVertexData=%v, ShuffleProcessingOrder=%v, MaxCommitDelayMs=%d, BATCH_NUM=%d, UseStaleReads=%v, StaleReadMode=%s, StalenessMs=%d, credentialsFile=%s",
+		VUS, ZONE_START, ZONES_TOTAL, RECORDS_PER_ZONE, EDGES_PER_RELATION, TOTAL_VERTICES, PreGenerateVertexData, ShuffleProcessingOrder, MaxCommitDelayMs, BATCH_NUM, UseStaleReads, StaleReadMode, StalenessMs, credentialsFile)
 }
 
 // setupLogging configures logging to output to both terminal and file
@@ -1350,7 +1395,7 @@ func spannerReadVertexTest(client *spanner.Client) {
 	log.Println("Starting Spanner read vertex test...")
 
 	// Total queries to execute
-	totalQueries := 5000000
+	totalQueries := 1000000
 	iterPerVU := int(math.Ceil(float64(totalQueries) / float64(VUS)))
 
 	var wg sync.WaitGroup
@@ -1407,7 +1452,7 @@ func spannerReadVertexTest(client *spanner.Client) {
 
 				// Build parameterized query
 				stmt := spanner.Statement{
-					SQL: `SELECT * FROM Users 
+					SQL: `SELECT uid FROM Users 
 						  WHERE attr11 = @attr11 AND attr12 > @attr12 AND attr13 > @attr13 
 						  LIMIT 300`,
 					Params: map[string]interface{}{
@@ -1419,7 +1464,26 @@ func spannerReadVertexTest(client *spanner.Client) {
 
 				queryStart := time.Now()
 				// Create a new single-use read-only transaction for each query
-				ro := client.Single()
+				var ro *spanner.ReadOnlyTransaction
+
+				if UseStaleReads {
+					// Configure stale read based on settings
+					if StaleReadMode == "max" {
+						// Maximum staleness - read data that's at most N milliseconds old
+						ro = client.Single().WithTimestampBound(
+							spanner.MaxStaleness(time.Duration(StalenessMs) * time.Millisecond))
+						log.Printf("VU %d using max staleness: %d ms", vuIndex, StalenessMs)
+					} else if StaleReadMode == "exact" {
+						// Exact staleness - read data that's exactly N milliseconds old
+						ro = client.Single().WithTimestampBound(
+							spanner.ExactStaleness(time.Duration(StalenessMs) * time.Millisecond))
+						log.Printf("VU %d using exact staleness: %d ms", vuIndex, StalenessMs)
+					}
+				} else {
+					// Use strong consistency (default)
+					ro = client.Single()
+				}
+
 				iterRows := ro.Query(ctx, stmt)
 
 				// Count rows and consume results
@@ -1494,11 +1558,23 @@ func main() {
 	var testType string
 	var startZone, endZone int
 	var batchNum int
+	var useStaleReads bool
+	var staleReadMode string
+	var stalenessMs int
+
 	flag.StringVar(&testType, "test", "setup", "Test type to run: setup, setupindex, write-vertex, write-edge, relation, all")
 	flag.IntVar(&startZone, "start-zone", ZONE_START, "Start zone ID for edge test")
 	flag.IntVar(&endZone, "end-zone", ZONE_START+ZONES_TOTAL, "End zone ID for edge test")
 	flag.IntVar(&batchNum, "batch-num", EDGES_PER_RELATION, "Number of edges per batch for edge write test")
+	flag.BoolVar(&useStaleReads, "stale-reads", UseStaleReads, "Enable stale reads for read operations")
+	flag.StringVar(&staleReadMode, "stale-mode", StaleReadMode, "Stale read mode: max or exact")
+	flag.IntVar(&stalenessMs, "staleness-ms", StalenessMs, "Staleness time in milliseconds")
 	flag.Parse()
+
+	// Update global variables from command line flags
+	UseStaleReads = useStaleReads
+	StaleReadMode = staleReadMode
+	StalenessMs = stalenessMs
 
 	ctx := context.Background()
 
@@ -1530,7 +1606,14 @@ func main() {
 		log.Fatalf("Failed to create Spanner client")
 	}
 	defer client.Close()
-
+	for i := 0; i < 16; i++ {
+		if err = client.Single().Query(ctx, spanner.NewStatement("SELECT * from Users limit 1")).Do(func(row *spanner.Row) error {
+			return nil
+		}); err != nil {
+			log.Printf("Failed to connect to Spanner database %s: %v", dbPath, err)
+			log.Fatalf("Spanner client required for test type: %s", testType)
+		}
+	}
 	log.Printf("Starting Spanner benchmark with test type: %s", testType)
 
 	// Execute tests based on command line option
