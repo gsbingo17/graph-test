@@ -1452,7 +1452,7 @@ func spannerReadVertexTest(client *spanner.Client) {
 
 				// Build parameterized query
 				stmt := spanner.Statement{
-					SQL: `SELECT uid FROM Users 
+					SQL: `SELECT * FROM Users 
 						  WHERE attr11 = @attr11 AND attr12 > @attr12 AND attr13 > @attr13 
 						  LIMIT 300`,
 					Params: map[string]interface{}{
@@ -1472,7 +1472,7 @@ func spannerReadVertexTest(client *spanner.Client) {
 						// Maximum staleness - read data that's at most N milliseconds old
 						ro = client.Single().WithTimestampBound(
 							spanner.MaxStaleness(time.Duration(StalenessMs) * time.Millisecond))
-						log.Printf("VU %d using max staleness: %d ms", vuIndex, StalenessMs)
+						// log.Printf("VU %d using max staleness: %d ms", vuIndex, StalenessMs)
 					} else if StaleReadMode == "exact" {
 						// Exact staleness - read data that's exactly N milliseconds old
 						ro = client.Single().WithTimestampBound(
