@@ -327,7 +327,7 @@ func setupAllTableIndexes(ctx context.Context) error {
 	// Create index for Users table
 	ddl = append(ddl,
 		`CREATE INDEX user_attr11_attr12_attr13_idx
-		   ON Users(uid, attr11, attr12, attr13) INTERLEAVE IN Users`,
+		   ON Users(attr11, attr12, attr13)`,
 	)
 
 	// Create indexes for edge tables
